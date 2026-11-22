@@ -99,6 +99,8 @@ static uint8_t junction_detect_count = 3;
 static uint8_t junction_clear_count = 0;
 static uint8_t junction_latched = 0;
 static uint32_t last_junction_ms = 0;
+static volatile uint8_t warehouse_turn_requested = 0;
+
 
 /**
  * @brief Displays the exact lab-guide sensor patterns on the onboard LEDs.
@@ -473,6 +475,11 @@ void Navigation_Controller(uint8_t data)
 
         Count_Warehouse_Junctions(data);
 
+        if (warehouse_junction_count >= 1)
+        {
+            warehouse_turn_requested = 1;
+        }
+
         Line_Follower_Controller(data);
 
         break;
@@ -640,10 +647,10 @@ int main(void)
 
     Motor_Init();
 
-    SysTick_Interrupt_Init(
-        SYSTICK_INT_NUM_CLK_CYCLES,
-        SYSTICK_INT_PRIORITY
-    );
+//    SysTick_Interrupt_Init(
+//        SYSTICK_INT_NUM_CLK_CYCLES,
+//        SYSTICK_INT_PRIORITY
+//    );
 
     Timer_A1_Interrupt_Init(
         &Timer_A1_Periodic_Task,
