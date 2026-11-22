@@ -100,6 +100,8 @@ static uint8_t junction_clear_count = 0;
 static uint8_t junction_latched = 0;
 static uint32_t last_junction_ms = 0;
 static volatile uint8_t warehouse_turn_requested = 0;
+static uint8_t warehouse_route_armed = 0;
+static uint8_t warehouse_center_count = 0;
 
 
 /**
@@ -472,17 +474,58 @@ void Navigation_Controller(uint8_t data)
     switch (navigation_state)
     {
     case EXPLORE_MAZE:
+    {
+        uint8_t previous_junction_count = warehouse_junction_count;
 
-        Count_Warehouse_Junctions(data);
-
-        if (warehouse_junction_count >= 1)
+        // Wait until the robot detects a straight section of tape.
+        if (!warehouse_route_armed)
         {
-            warehouse_turn_requested = 1;
+            if (((data & 0x18u) == 0x18u) &&
+                !Is_T_Intersection(data) &&
+                !Is_Left_Corner(data) &&
+                !Is_Right_Corner(data))
+            {
+                if (warehouse_center_count < 3u)
+                {
+                    warehouse_center_count++;
+                }
+
+                if (warehouse_center_count >= 3u)
+                {
+                    warehouse_route_armed = 1u;
+                }
+            }
+            else
+            {
+                warehouse_center_count = 0;
+            }
+
+            Line_Follower_Controller(data);
+            break;
         }
 
-        Line_Follower_Controller(data);
+        // Count intersections only after the route is armed.
+        if (warehouse_turn_requested == 0u)
+        {
+            Count_Warehouse_Junctions(data);
+        }
+
+        // Turn only when the first junction is newly detected.
+        if ((previous_junction_count == 0u) &&
+            (warehouse_junction_count == 1u) &&
+            (warehouse_turn_requested == 0u))
+        {
+            warehouse_turn_requested = 2u;
+
+            Start_Turn(TURN_LEFT_90);
+        }
+        else
+        {
+            Line_Follower_Controller(data);
+        }
 
         break;
+    }
 
         case EXPLORE_INTERSECTION:
 
