@@ -37,6 +37,10 @@
 #define MIN_RETURN_MS           1500
 #define DEAD_END_SAMPLES           3
 #define TURN_CENTER_SAMPLES        2
+#define JUNCTION_CONFIRM_SAMPLES     2
+#define JUNCTION_CLEAR_SAMPLES       8
+#define JUNCTION_MIN_INTERVAL_MS   300
+
 
 static uint32_t Timer_A1_ms_elapsed = 0;
 
@@ -88,6 +92,13 @@ static uint8_t dead_end_count = 0;
 static uint8_t turn_center_count = 0;
 static uint8_t branch_line_seen = 0;
 static uint8_t navigation_error = 0;
+static volatile uint8_t warehouse_junction_count = 0;
+static volatile uint8_t warehouse_sensor_data = 0;
+
+static uint8_t junction_detect_count = 3;
+static uint8_t junction_clear_count = 0;
+static uint8_t junction_latched = 0;
+static uint32_t last_junction_ms = 0;
 
 /**
  * @brief Displays the exact lab-guide sensor patterns on the onboard LEDs.
@@ -380,6 +391,59 @@ static void Follow_Track(uint8_t data)
     }
 }
 
+static void Count_Warehouse_Junctions(uint8_t data)
+{
+    uint8_t junction_detected;
+
+    warehouse_sensor_data = data;
+
+    junction_detected =
+        Is_Left_Corner(data) || Is_T_Intersection(data);
+
+    if (junction_detected)
+    {
+        junction_clear_count = 0;
+
+        if (junction_detect_count < JUNCTION_CONFIRM_SAMPLES)
+        {
+            junction_detect_count++;
+        }
+
+        if ((junction_detect_count >= JUNCTION_CONFIRM_SAMPLES) &&
+            !junction_latched)
+        {
+            junction_latched = 1;
+
+            if ((warehouse_junction_count == 0) ||
+                ((Timer_A1_ms_elapsed - last_junction_ms) >=
+                 JUNCTION_MIN_INTERVAL_MS))
+            {
+                if (warehouse_junction_count < 3)
+                {
+                    warehouse_junction_count++;
+                }
+
+                last_junction_ms = Timer_A1_ms_elapsed;
+            }
+        }
+    }
+    else
+    {
+        junction_detect_count = 0;
+
+        if (junction_latched)
+        {
+            junction_clear_count++;
+
+            if (junction_clear_count >= JUNCTION_CLEAR_SAMPLES)
+            {
+                junction_latched = 0;
+                junction_clear_count = 0;
+            }
+        }
+    }
+}
+
 /**
  * Follows the initial path, explores the left and right T-intersection
  * branches, returns along the original route, and stops at the starting
@@ -405,20 +469,13 @@ void Navigation_Controller(uint8_t data)
 
     switch (navigation_state)
     {
-        case EXPLORE_MAZE:
+    case EXPLORE_MAZE:
 
-            if (Is_T_Intersection(data))
-            {
-                navigation_state = EXPLORE_INTERSECTION;
-                intersection_phase = LEFT_BRANCH_OUT;
+        Count_Warehouse_Junctions(data);
 
-                Start_Turn(TURN_LEFT_90);
-            }
-            else
-            {
-                Follow_Track(data);
-            }
-            break;
+        Line_Follower_Controller(data);
+
+        break;
 
         case EXPLORE_INTERSECTION:
 
@@ -600,3 +657,4 @@ int main(void)
 
     }
 }
+
