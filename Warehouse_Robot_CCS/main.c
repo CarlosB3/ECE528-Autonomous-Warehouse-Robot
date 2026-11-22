@@ -40,7 +40,7 @@
 #define JUNCTION_CONFIRM_SAMPLES     2
 #define JUNCTION_CLEAR_SAMPLES       8
 #define JUNCTION_MIN_INTERVAL_MS   300
-
+#define WAREHOUSE_DESTINATION      3u
 
 static uint32_t Timer_A1_ms_elapsed = 0;
 
@@ -511,8 +511,8 @@ void Navigation_Controller(uint8_t data)
         }
 
         // Turn only when the first junction is newly detected.
-        if ((previous_junction_count == 0u) &&
-            (warehouse_junction_count == 1u) &&
+        if ((previous_junction_count < WAREHOUSE_DESTINATION) &&
+            (warehouse_junction_count == WAREHOUSE_DESTINATION) &&
             (warehouse_turn_requested == 0u))
         {
             warehouse_turn_requested = 2u;
