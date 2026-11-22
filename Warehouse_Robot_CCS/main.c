@@ -21,6 +21,7 @@
 #include "inc/Timer_A1_Interrupt.h"
 #include "inc/SysTick_Interrupt.h"
 #include "inc/Reflectance_Sensor.h"
+#include "inc/BLE_UART.h"
 
 // These values are PWM timer counts, not percentages.
 #define PWM_NOMINAL              2500
@@ -102,7 +103,11 @@ static uint32_t last_junction_ms = 0;
 static volatile uint8_t warehouse_turn_requested = 0;
 static uint8_t warehouse_route_armed = 0;
 static uint8_t warehouse_center_count = 0;
-
+static volatile uint8_t ble_last_button = 0;
+static volatile uint8_t ble_last_state = 0;
+static volatile uint32_t ble_packet_count = 0;
+static volatile uint32_t ble_text_count = 0;
+static volatile uint8_t ble_selected_destination = 0;
 
 /**
  * @brief Displays the exact lab-guide sensor patterns on the onboard LEDs.
@@ -677,6 +682,7 @@ void Timer_A1_Periodic_Task(void)
  */
 int main(void)
 {
+    char BLE_UART_Buffer[BLE_UART_BUFFER_SIZE] = {0};
     DisableInterrupts();
 
     Clock_Init48MHz();
@@ -685,6 +691,10 @@ int main(void)
     LED2_Init();
 
     EUSCI_A0_UART_Init_Printf();
+
+    BLE_UART_Init();
+
+    P1->OUT &= ~0x40u;
 
     Reflectance_Sensor_Init();
 
@@ -704,7 +714,33 @@ int main(void)
 
     while (1)
     {
+        BLE_UART_InString(
+                BLE_UART_Buffer,
+                BLE_UART_BUFFER_SIZE
+            );
 
+            ble_text_count++;
+
+            switch (BLE_UART_Buffer[0])
+            {
+                case 'A':
+                    ble_selected_destination = 1;
+                    break;
+
+                case 'B':
+                    ble_selected_destination = 2;
+                    break;
+
+                case 'C':
+                    ble_selected_destination = 3;
+                    break;
+
+                default:
+                    break;
+            }
+
+            BLE_UART_OutString("Received: ");
+            BLE_UART_OutString(BLE_UART_Buffer);
+            BLE_UART_OutString("\r\n");
     }
 }
-
