@@ -1,4 +1,3 @@
-
 /**
  * @file main.c
  * @brief Interrupt-driven line follower and maze navigation for ECE 528/L Lab 3.
@@ -11,6 +10,7 @@
  * @author Carlos Bautista
  */
 
+#include <string.h>
 #include <stdint.h>
 #include "msp.h"
 #include "inc/Clock.h"
@@ -29,7 +29,7 @@
 #define POSITION_GAIN_DIVISOR      48
 
 // Starting calibration values (milliseconds).
-#define TURN_90_MIN_MS           180
+#define TURN_90_MIN_MS           500
 #define TURN_180_MIN_MS          550
 #define TURN_TIMEOUT_MS         1800
 #define CORNER_IGNORE_MS         130
@@ -41,7 +41,6 @@
 #define JUNCTION_CONFIRM_SAMPLES     2
 #define JUNCTION_CLEAR_SAMPLES       8
 #define JUNCTION_MIN_INTERVAL_MS   300
-#define WAREHOUSE_DESTINATION      3u
 
 static uint32_t Timer_A1_ms_elapsed = 0;
 
@@ -96,7 +95,7 @@ static uint8_t navigation_error = 0;
 static volatile uint8_t warehouse_junction_count = 0;
 static volatile uint8_t warehouse_sensor_data = 0;
 
-static uint8_t junction_detect_count = 3;
+static uint8_t junction_detect_count = 0;
 static uint8_t junction_clear_count = 0;
 static uint8_t junction_latched = 0;
 static uint32_t last_junction_ms = 0;
@@ -108,6 +107,9 @@ static volatile uint8_t ble_last_state = 0;
 static volatile uint32_t ble_packet_count = 0;
 static volatile uint32_t ble_text_count = 0;
 static volatile uint8_t ble_selected_destination = 0;
+static volatile uint8_t warehouse_active_destination = 0;
+static volatile uint8_t warehouse_run_enabled = 0;
+static volatile uint8_t warehouse_stop_latched = 0;
 
 /**
  * @brief Displays the exact lab-guide sensor patterns on the onboard LEDs.
@@ -461,6 +463,11 @@ static void Count_Warehouse_Junctions(uint8_t data)
  */
 void Navigation_Controller(uint8_t data)
 {
+    if (!warehouse_run_enabled)
+    {
+        Motor_Stop();
+        return;
+    }
     uint32_t elapsed =
         Timer_A1_ms_elapsed - phase_start_ms;
 
@@ -516,8 +523,8 @@ void Navigation_Controller(uint8_t data)
         }
 
         // Turn only when the first junction is newly detected.
-        if ((previous_junction_count < WAREHOUSE_DESTINATION) &&
-            (warehouse_junction_count == WAREHOUSE_DESTINATION) &&
+        if ((previous_junction_count < warehouse_active_destination) &&
+            (warehouse_junction_count == warehouse_active_destination) &&
             (warehouse_turn_requested == 0u))
         {
             warehouse_turn_requested = 2u;
@@ -715,32 +722,63 @@ int main(void)
     while (1)
     {
         BLE_UART_InString(
-                BLE_UART_Buffer,
-                BLE_UART_BUFFER_SIZE
-            );
+            BLE_UART_Buffer,
+            BLE_UART_BUFFER_SIZE
+        );
 
-            ble_text_count++;
+        ble_text_count++;
 
-            switch (BLE_UART_Buffer[0])
+        // Remove carriage return if one was received.
+        char *cr = strchr(BLE_UART_Buffer, '\r');
+
+        if (cr != NULL)
+        {
+            *cr = '\0';
+        }
+
+        if (strcmp(BLE_UART_Buffer, "A") == 0)
+        {
+            if (!warehouse_run_enabled)
             {
-                case 'A':
-                    ble_selected_destination = 1;
-                    break;
-
-                case 'B':
-                    ble_selected_destination = 2;
-                    break;
-
-                case 'C':
-                    ble_selected_destination = 3;
-                    break;
-
-                default:
-                    break;
+                ble_selected_destination = 1;
             }
+        }
+        else if (strcmp(BLE_UART_Buffer, "B") == 0)
+        {
+            if (!warehouse_run_enabled)
+            {
+                ble_selected_destination = 2;
+            }
+        }
+        else if (strcmp(BLE_UART_Buffer, "C") == 0)
+        {
+            if (!warehouse_run_enabled)
+            {
+                ble_selected_destination = 3;
+            }
+        }
+        else if (strcmp(BLE_UART_Buffer, "START") == 0)
+        {
+            if ((ble_selected_destination != 0) &&
+                !warehouse_run_enabled &&
+                !warehouse_stop_latched)
+            {
+                warehouse_active_destination =
+                    ble_selected_destination;
 
-            BLE_UART_OutString("Received: ");
-            BLE_UART_OutString(BLE_UART_Buffer);
-            BLE_UART_OutString("\r\n");
+                warehouse_run_enabled = 1;
+
+                BLE_UART_OutString("STARTED\r\n");
+            }
+        }
+        else if (strcmp(BLE_UART_Buffer, "STOP") == 0)
+        {
+            warehouse_run_enabled = 0;
+            warehouse_stop_latched = 1;
+
+            Motor_Stop();
+
+            BLE_UART_OutString("STOPPED\r\n");
+        }
     }
 }
