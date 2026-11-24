@@ -1,3 +1,4 @@
+
 /**
  * @file main.c
  * @brief Interrupt-driven line follower and maze navigation for ECE 528/L Lab 3.
@@ -22,6 +23,7 @@
 #include "inc/SysTick_Interrupt.h"
 #include "inc/Reflectance_Sensor.h"
 #include "inc/BLE_UART.h"
+#include "inc/Bumper_Switches.h"
 
 // These values are PWM timer counts, not percentages.
 #define PWM_NOMINAL              2500
@@ -111,6 +113,9 @@ static volatile uint8_t warehouse_active_destination = 0;
 static volatile uint8_t warehouse_run_enabled = 0;
 static volatile uint8_t warehouse_stop_latched = 0;
 
+// Bumper collision safety latch.
+static volatile uint8_t warehouse_collision_latched = 0;
+
 /**
  * @brief Displays the exact lab-guide sensor patterns on the onboard LEDs.
  */
@@ -165,7 +170,7 @@ void Detect_Line_Position(uint8_t data)
 }
 
 /**
- return Number of sensors detecting black, from 0 to 8.
+ * return Number of sensors detecting black, from 0 to 8.
  */
 static uint8_t Count_Black_Sensors(uint8_t data)
 {
@@ -349,7 +354,6 @@ static void Execute_Turn(uint8_t data)
 
 /**
  * Confirms a dead end using consecutive all-white readings.
- *
  */
 static uint8_t Dead_End_Confirmed(uint8_t data)
 {
@@ -372,7 +376,6 @@ static uint8_t Dead_End_Confirmed(uint8_t data)
  * Ignores repeated corner detections briefly after a turn, follows the
  * line using motor PWM corrections, and drives forward across a wide
  * intersection reading.
- *
  */
 static void Follow_Track(uint8_t data)
 {
@@ -459,7 +462,6 @@ static void Count_Warehouse_Junctions(uint8_t data)
  * Follows the initial path, explores the left and right T-intersection
  * branches, returns along the original route, and stops at the starting
  * dead end. Active turns are completed before normal state processing.
- *
  */
 void Navigation_Controller(uint8_t data)
 {
@@ -468,6 +470,7 @@ void Navigation_Controller(uint8_t data)
         Motor_Stop();
         return;
     }
+
     uint32_t elapsed =
         Timer_A1_ms_elapsed - phase_start_ms;
 
@@ -682,9 +685,27 @@ void Timer_A1_Periodic_Task(void)
 }
 
 /**
+ * @brief Handles bumper-triggered collisions.
+ *
+ * Stops the robot immediately and prevents restarting
+ * until the MSP432 is reset.
+ */
+static void Bumper_Collision_Handler(uint8_t bumper_state)
+{
+    (void)bumper_state;
 
+    warehouse_collision_latched = 1;
+    warehouse_run_enabled = 0;
+    warehouse_stop_latched = 1;
+
+    Motor_Stop();
+}
+
+/**
  * Disables interrupts during setup, initializes the clock, onboard LEDs,
- * UART, reflectance sensor, motors, and timers, then enables interrupts.
+ * UART, reflectance sensor, motors, bumpers, and timers,
+ * then enables interrupts.
+ *
  * @return Does not return during normal operation.
  */
 int main(void)
@@ -706,6 +727,19 @@ int main(void)
     Reflectance_Sensor_Init();
 
     Motor_Init();
+
+    // Initialize bumper switches and their collision callback.
+    Bumper_Switches_Init(&Bumper_Collision_Handler);
+
+    // Check for a bumper already pressed at startup.
+    {
+        uint8_t initial_bumper_state = Bumper_Read();
+
+        if (initial_bumper_state != 0u)
+        {
+            Bumper_Collision_Handler(initial_bumper_state);
+        }
+    }
 
 //    SysTick_Interrupt_Init(
 //        SYSTICK_INT_NUM_CLK_CYCLES,
