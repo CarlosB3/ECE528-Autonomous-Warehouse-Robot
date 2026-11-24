@@ -1,12 +1,11 @@
 
 /**
  * @file main.c
- * @brief Interrupt-driven line follower and maze navigation for ECE 528/L Lab 3.
+ * @brief Interrupt-driven line follower and warehouse navigation.
  *
- * The MSP432 samples the QTRX array every 10 ms, follows the black line,
- * explores both branches of the T-intersection, and returns to the starting
- * dead end. This controller targets the example maze in the Lab 3 handout.
- * Turning times and sensor thresholds require physical calibration.
+ * Station A/B: Timed left turn, short forward movement,
+ *              then normal sensor-based line following.
+ * Station C:   Original Lab 3 sensor-based turn.
  *
  * @author Carlos Bautista
  */
@@ -25,24 +24,29 @@
 #include "inc/BLE_UART.h"
 #include "inc/Bumper_Switches.h"
 
-// These values are PWM timer counts, not percentages.
 #define PWM_NOMINAL              2500
 #define PWM_CORRECTION           1000
 #define POSITION_GAIN_DIVISOR      48
 
-// Starting calibration values (milliseconds).
-#define TURN_90_MIN_MS           500
-#define TURN_180_MIN_MS          550
-#define TURN_TIMEOUT_MS         1800
-#define CORNER_IGNORE_MS         130
-#define CROSS_INTERSECTION_MS    180
-#define MIN_BRANCH_MS            350
-#define MIN_RETURN_MS           1500
-#define DEAD_END_SAMPLES           3
-#define TURN_CENTER_SAMPLES        2
-#define JUNCTION_CONFIRM_SAMPLES     2
-#define JUNCTION_CLEAR_SAMPLES       8
-#define JUNCTION_MIN_INTERVAL_MS   300
+// Original Lab 3 turn settings.
+// Station C uses these values.
+#define TURN_90_MIN_MS            180
+#define TURN_180_MIN_MS           550
+#define TURN_TIMEOUT_MS          1800
+
+// Stations A/B only: verified maneuver settings.
+#define AB_TURN_MS               1200
+#define AB_FORWARD_MS             200
+
+#define CORNER_IGNORE_MS          130
+#define CROSS_INTERSECTION_MS     180
+#define MIN_BRANCH_MS             350
+#define MIN_RETURN_MS            1500
+#define DEAD_END_SAMPLES            3
+#define TURN_CENTER_SAMPLES         2
+#define JUNCTION_CONFIRM_SAMPLES    2
+#define JUNCTION_CLEAR_SAMPLES      8
+#define JUNCTION_MIN_INTERVAL_MS  300
 
 static uint32_t Timer_A1_ms_elapsed = 0;
 
@@ -92,8 +96,22 @@ static uint32_t turn_start_ms = 0;
 static uint32_t last_turn_finish_ms = 0;
 static uint8_t dead_end_count = 0;
 static uint8_t turn_center_count = 0;
+
+// Dedicated A/B maneuver.
+// Sensor readings do not control either timed stage.
+typedef enum
+{
+    AB_IDLE,
+    AB_ROTATING,
+    AB_MOVING_FORWARD
+} AB_Maneuver_State;
+
+static AB_Maneuver_State warehouse_ab_state = AB_IDLE;
+static uint32_t warehouse_ab_stage_start_ms = 0;
+
 static uint8_t branch_line_seen = 0;
 static uint8_t navigation_error = 0;
+
 static volatile uint8_t warehouse_junction_count = 0;
 static volatile uint8_t warehouse_sensor_data = 0;
 
@@ -101,23 +119,24 @@ static uint8_t junction_detect_count = 0;
 static uint8_t junction_clear_count = 0;
 static uint8_t junction_latched = 0;
 static uint32_t last_junction_ms = 0;
+
 static volatile uint8_t warehouse_turn_requested = 0;
 static uint8_t warehouse_route_armed = 0;
 static uint8_t warehouse_center_count = 0;
+
 static volatile uint8_t ble_last_button = 0;
 static volatile uint8_t ble_last_state = 0;
 static volatile uint32_t ble_packet_count = 0;
 static volatile uint32_t ble_text_count = 0;
+
 static volatile uint8_t ble_selected_destination = 0;
 static volatile uint8_t warehouse_active_destination = 0;
 static volatile uint8_t warehouse_run_enabled = 0;
 static volatile uint8_t warehouse_stop_latched = 0;
-
-// Bumper collision safety latch.
 static volatile uint8_t warehouse_collision_latched = 0;
 
 /**
- * @brief Displays the exact lab-guide sensor patterns on the onboard LEDs.
+ * @brief Displays sensor patterns using the onboard LEDs.
  */
 void Detect_Line_Position(uint8_t data)
 {
@@ -170,7 +189,7 @@ void Detect_Line_Position(uint8_t data)
 }
 
 /**
- * return Number of sensors detecting black, from 0 to 8.
+ * @brief Counts sensors detecting black.
  */
 static uint8_t Count_Black_Sensors(uint8_t data)
 {
@@ -189,10 +208,7 @@ static uint8_t Count_Black_Sensors(uint8_t data)
 }
 
 /**
- * Checks for a T-intersection using the reflectance sensor pattern.
- *
- * Detects an all-black reading or a sufficiently wide black region that
- * includes both outer sensors and at least one center sensor.
+ * @brief Detects a T-intersection pattern.
  */
 static uint8_t Is_T_Intersection(uint8_t data)
 {
@@ -203,7 +219,7 @@ static uint8_t Is_T_Intersection(uint8_t data)
 }
 
 /**
- * @brief Checks whether the sensor pattern indicates a left corner.
+ * @brief Checks for a left corner.
  */
 static uint8_t Is_Left_Corner(uint8_t data)
 {
@@ -213,7 +229,7 @@ static uint8_t Is_Left_Corner(uint8_t data)
 }
 
 /**
- * Checks whether the sensor pattern indicates a right corner.
+ * @brief Checks for a right corner.
  */
 static uint8_t Is_Right_Corner(uint8_t data)
 {
@@ -223,9 +239,7 @@ static uint8_t Is_Right_Corner(uint8_t data)
 }
 
 /**
- * Stops if no black line is detected. Otherwise, calculates a limited
- * correction from the line position and rotates toward the line when
- * the deviation is large.
+ * @brief Follows the black line using proportional correction.
  */
 void Line_Follower_Controller(uint8_t data)
 {
@@ -270,8 +284,9 @@ void Line_Follower_Controller(uint8_t data)
 }
 
 /**
- * Records the turn start time, clears detection counters, and commands
- * the motors to rotate in the requested direction.
+ * @brief Starts the original Lab 3 sensor-based turn.
+ *
+ * This routine is used by Station C.
  */
 static void Start_Turn(Turn_State requested_turn)
 {
@@ -291,9 +306,76 @@ static void Start_Turn(Turn_State requested_turn)
 }
 
 /**
- * Uses a minimum turn duration and two consecutive centered readings
- * to finish a turn. If the turn times out, the robot stops and enters
- * the FINISHED state with an error flag.
+ * @brief Starts the dedicated A/B timed maneuver.
+ *
+ * First rotate left, then move straight forward.
+ * Sensor-based navigation resumes afterward.
+ */
+static void Start_AB_Maneuver(void)
+{
+    warehouse_ab_state = AB_ROTATING;
+    warehouse_ab_stage_start_ms = Timer_A1_ms_elapsed;
+
+    turn_center_count = 0;
+    dead_end_count = 0;
+
+    Motor_Left(PWM_NOMINAL, PWM_NOMINAL);
+}
+
+/**
+ * @brief Executes the A/B turn-then-forward maneuver.
+ */
+static void Execute_AB_Maneuver(uint8_t data)
+{
+    uint32_t elapsed =
+        Timer_A1_ms_elapsed - warehouse_ab_stage_start_ms;
+
+    if (warehouse_ab_state == AB_ROTATING)
+    {
+        if (elapsed < AB_TURN_MS)
+        {
+            Motor_Left(PWM_NOMINAL, PWM_NOMINAL);
+            return;
+        }
+
+        // Finish the rotation.
+        // Begin the straight-forward stage.
+        warehouse_ab_state = AB_MOVING_FORWARD;
+        warehouse_ab_stage_start_ms = Timer_A1_ms_elapsed;
+
+        Motor_Forward(PWM_NOMINAL, PWM_NOMINAL);
+        return;
+    }
+
+    if (warehouse_ab_state == AB_MOVING_FORWARD)
+    {
+        if (elapsed < AB_FORWARD_MS)
+        {
+            // Ignore sensor readings during this movement.
+            Motor_Forward(PWM_NOMINAL, PWM_NOMINAL);
+            return;
+        }
+
+        // Both stages are complete.
+        // Resume normal sensor-based line following.
+        warehouse_ab_state = AB_IDLE;
+
+        last_turn_finish_ms = Timer_A1_ms_elapsed;
+        phase_start_ms = Timer_A1_ms_elapsed;
+
+        dead_end_count = 0;
+        branch_line_seen = 1;
+
+        Line_Follower_Controller(data);
+    }
+}
+
+/**
+ * @brief Original Lab 3 sensor-based turning routine.
+ *
+ * Station C uses this function.
+ * It requires the minimum turning duration and two
+ * consecutive centered readings before finishing.
  */
 static void Execute_Turn(uint8_t data)
 {
@@ -333,8 +415,10 @@ static void Execute_Turn(uint8_t data)
     if (turn_center_count >= TURN_CENTER_SAMPLES)
     {
         turn_state = NO_TURN;
+
         last_turn_finish_ms = Timer_A1_ms_elapsed;
         phase_start_ms = Timer_A1_ms_elapsed;
+
         dead_end_count = 0;
         branch_line_seen = 1;
 
@@ -353,7 +437,7 @@ static void Execute_Turn(uint8_t data)
 }
 
 /**
- * Confirms a dead end using consecutive all-white readings.
+ * @brief Confirms a dead end using consecutive white readings.
  */
 static uint8_t Dead_End_Confirmed(uint8_t data)
 {
@@ -373,9 +457,7 @@ static uint8_t Dead_End_Confirmed(uint8_t data)
 }
 
 /**
- * Ignores repeated corner detections briefly after a turn, follows the
- * line using motor PWM corrections, and drives forward across a wide
- * intersection reading.
+ * @brief Follows the track and handles corner patterns.
  */
 static void Follow_Track(uint8_t data)
 {
@@ -405,6 +487,9 @@ static void Follow_Track(uint8_t data)
     }
 }
 
+/**
+ * @brief Counts warehouse junctions using confirmation and latching.
+ */
 static void Count_Warehouse_Junctions(uint8_t data)
 {
     uint8_t junction_detected;
@@ -459,9 +544,10 @@ static void Count_Warehouse_Junctions(uint8_t data)
 }
 
 /**
- * Follows the initial path, explores the left and right T-intersection
- * branches, returns along the original route, and stops at the starting
- * dead end. Active turns are completed before normal state processing.
+ * @brief Controls navigation toward the selected warehouse station.
+ *
+ * A/B use the timed maneuver.
+ * C uses the original Lab 3 turning routine.
  */
 void Navigation_Controller(uint8_t data)
 {
@@ -480,6 +566,15 @@ void Navigation_Controller(uint8_t data)
         return;
     }
 
+    // Stations A/B: complete both timed stages
+    // before sensor-based navigation resumes.
+    if (warehouse_ab_state != AB_IDLE)
+    {
+        Execute_AB_Maneuver(data);
+        return;
+    }
+
+    // Station C: original Lab 3 turn handling.
     if (turn_state != NO_TURN)
     {
         Execute_Turn(data);
@@ -488,62 +583,75 @@ void Navigation_Controller(uint8_t data)
 
     switch (navigation_state)
     {
-    case EXPLORE_MAZE:
-    {
-        uint8_t previous_junction_count = warehouse_junction_count;
-
-        // Wait until the robot detects a straight section of tape.
-        if (!warehouse_route_armed)
+        case EXPLORE_MAZE:
         {
-            if (((data & 0x18u) == 0x18u) &&
-                !Is_T_Intersection(data) &&
-                !Is_Left_Corner(data) &&
-                !Is_Right_Corner(data))
+            uint8_t previous_junction_count =
+                warehouse_junction_count;
+
+            // Arm navigation after seeing a centered line.
+            if (!warehouse_route_armed)
             {
-                if (warehouse_center_count < 3u)
+                if (((data & 0x18u) == 0x18u) &&
+                    !Is_T_Intersection(data) &&
+                    !Is_Left_Corner(data) &&
+                    !Is_Right_Corner(data))
                 {
-                    warehouse_center_count++;
+                    if (warehouse_center_count < 3u)
+                    {
+                        warehouse_center_count++;
+                    }
+
+                    if (warehouse_center_count >= 3u)
+                    {
+                        warehouse_route_armed = 1u;
+                    }
+                }
+                else
+                {
+                    warehouse_center_count = 0;
                 }
 
-                if (warehouse_center_count >= 3u)
+                Line_Follower_Controller(data);
+                break;
+            }
+
+            // Count junctions until the selected one is reached.
+            if (warehouse_turn_requested == 0u)
+            {
+                Count_Warehouse_Junctions(data);
+            }
+
+            if ((previous_junction_count <
+                 warehouse_active_destination) &&
+                (warehouse_junction_count ==
+                 warehouse_active_destination) &&
+                (warehouse_turn_requested == 0u))
+            {
+                warehouse_turn_requested = 2u;
+
+                if (warehouse_active_destination <= 2u)
                 {
-                    warehouse_route_armed = 1u;
+                    // Station A or B:
+                    // 1200 ms left, then 200 ms forward.
+                    Start_AB_Maneuver();
+                }
+                else
+                {
+                    // Station C:
+                    // Original Lab 3 sensor-based left turn.
+                    Start_Turn(TURN_LEFT_90);
                 }
             }
             else
             {
-                warehouse_center_count = 0;
+                Line_Follower_Controller(data);
             }
 
-            Line_Follower_Controller(data);
             break;
         }
 
-        // Count intersections only after the route is armed.
-        if (warehouse_turn_requested == 0u)
-        {
-            Count_Warehouse_Junctions(data);
-        }
-
-        // Turn only when the first junction is newly detected.
-        if ((previous_junction_count < warehouse_active_destination) &&
-            (warehouse_junction_count == warehouse_active_destination) &&
-            (warehouse_turn_requested == 0u))
-        {
-            warehouse_turn_requested = 2u;
-
-            Start_Turn(TURN_LEFT_90);
-        }
-        else
-        {
-            Line_Follower_Controller(data);
-        }
-
-        break;
-    }
-
         case EXPLORE_INTERSECTION:
-
+        {
             switch (intersection_phase)
             {
                 case LEFT_BRANCH_OUT:
@@ -575,6 +683,7 @@ void Navigation_Controller(uint8_t data)
                     {
                         intersection_phase = RIGHT_BRANCH_OUT;
                         phase_start_ms = Timer_A1_ms_elapsed;
+
                         dead_end_count = 0;
                         branch_line_seen = 0;
 
@@ -633,10 +742,13 @@ void Navigation_Controller(uint8_t data)
                 default:
                     navigation_error = 1;
                     navigation_state = FINISHED;
+
                     Motor_Stop();
                     break;
             }
+
             break;
+        }
 
         case RETURN_TO_START:
 
@@ -661,8 +773,9 @@ void Navigation_Controller(uint8_t data)
 }
 
 /**
- * Called every 1 ms by Timer_A1. Starts a sensor reading every 10 ms,
- * completes it 1 ms later, then updates the LEDs and maze controller.
+ * @brief Timer_A1 periodic task.
+ *
+ * Updates the sensor readings every 10 ms.
  */
 void Timer_A1_Periodic_Task(void)
 {
@@ -685,10 +798,9 @@ void Timer_A1_Periodic_Task(void)
 }
 
 /**
- * @brief Handles bumper-triggered collisions.
+ * @brief Immediately stops the robot after a bumper collision.
  *
- * Stops the robot immediately and prevents restarting
- * until the MSP432 is reset.
+ * Prevents restarting until reset.
  */
 static void Bumper_Collision_Handler(uint8_t bumper_state)
 {
@@ -702,15 +814,12 @@ static void Bumper_Collision_Handler(uint8_t bumper_state)
 }
 
 /**
- * Disables interrupts during setup, initializes the clock, onboard LEDs,
- * UART, reflectance sensor, motors, bumpers, and timers,
- * then enables interrupts.
- *
- * @return Does not return during normal operation.
+ * @brief Main program initialization and Bluetooth command handling.
  */
 int main(void)
 {
     char BLE_UART_Buffer[BLE_UART_BUFFER_SIZE] = {0};
+
     DisableInterrupts();
 
     Clock_Init48MHz();
@@ -728,10 +837,9 @@ int main(void)
 
     Motor_Init();
 
-    // Initialize bumper switches and their collision callback.
     Bumper_Switches_Init(&Bumper_Collision_Handler);
 
-    // Check for a bumper already pressed at startup.
+    // Latch any bumper already pressed at startup.
     {
         uint8_t initial_bumper_state = Bumper_Read();
 
@@ -741,10 +849,11 @@ int main(void)
         }
     }
 
-//    SysTick_Interrupt_Init(
-//        SYSTICK_INT_NUM_CLK_CYCLES,
-//        SYSTICK_INT_PRIORITY
-//    );
+    // SysTick remains disabled.
+    // SysTick_Interrupt_Init(
+    //     SYSTICK_INT_NUM_CLK_CYCLES,
+    //     SYSTICK_INT_PRIORITY
+    // );
 
     Timer_A1_Interrupt_Init(
         &Timer_A1_Periodic_Task,
@@ -762,7 +871,6 @@ int main(void)
 
         ble_text_count++;
 
-        // Remove carriage return if one was received.
         char *cr = strchr(BLE_UART_Buffer, '\r');
 
         if (cr != NULL)
