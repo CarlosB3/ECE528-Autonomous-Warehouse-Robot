@@ -1,13 +1,16 @@
 
 /**
  * @file main.c
- * @brief Interrupt-driven line follower and warehouse navigation.
+ * @brief ECE 528/L warehouse robot navigation.
  *
- * Station A/B: Timed left turn, short forward movement,
- *              then normal sensor-based line following.
- * Station C:   Original Lab 3 sensor-based turn.
+ * Station A/B: Timed left turn, then forward movement.
+ * Station C: Original Lab 3 sensor-based turn.
  *
- * @author Carlos Bautista
+ * Phase 7: Detect delivery T-marker using three 0xFF readings.
+ * Phase 8: Stop for three seconds at the delivery station.
+ *
+ * The robot remains stopped after the pause until the
+ * turnaround and return-home phases are implemented.
  */
 
 #include <string.h>
@@ -28,13 +31,12 @@
 #define PWM_CORRECTION           1000
 #define POSITION_GAIN_DIVISOR      48
 
-// Original Lab 3 turn settings.
-// Station C uses these values.
+// Original Lab 3 turn settings for Station C.
 #define TURN_90_MIN_MS            180
 #define TURN_180_MIN_MS           550
 #define TURN_TIMEOUT_MS          1800
 
-// Stations A/B only: verified maneuver settings.
+// Verified Station A/B maneuver settings.
 #define AB_TURN_MS               1200
 #define AB_FORWARD_MS             200
 
@@ -47,6 +49,11 @@
 #define JUNCTION_CONFIRM_SAMPLES    2
 #define JUNCTION_CLEAR_SAMPLES      8
 #define JUNCTION_MIN_INTERVAL_MS  300
+
+// NEW - Phase 7 and Phase 8.
+#define DELIVERY_BRANCH_CONFIRM_SAMPLES  3
+#define DELIVERY_MARKER_CONFIRM_SAMPLES  3
+#define DELIVERY_PAUSE_MS             3000
 
 static uint32_t Timer_A1_ms_elapsed = 0;
 
@@ -97,8 +104,7 @@ static uint32_t last_turn_finish_ms = 0;
 static uint8_t dead_end_count = 0;
 static uint8_t turn_center_count = 0;
 
-// Dedicated A/B maneuver.
-// Sensor readings do not control either timed stage.
+// Dedicated Station A/B maneuver.
 typedef enum
 {
     AB_IDLE,
@@ -135,9 +141,29 @@ static volatile uint8_t warehouse_run_enabled = 0;
 static volatile uint8_t warehouse_stop_latched = 0;
 static volatile uint8_t warehouse_collision_latched = 0;
 
-/**
- * @brief Displays sensor patterns using the onboard LEDs.
- */
+// ============================================================
+// NEW - Phase 7 and Phase 8 delivery detection state.
+// ============================================================
+
+typedef enum
+{
+    DELIVERY_WAIT_FOR_BRANCH,
+    DELIVERY_SEARCH_FOR_MARKER,
+    DELIVERY_PAUSING,
+    DELIVERY_PAUSE_COMPLETE
+} Delivery_Phase;
+
+static Delivery_Phase delivery_phase = DELIVERY_WAIT_FOR_BRANCH;
+
+static uint8_t delivery_branch_count = 0;
+static uint8_t delivery_marker_count = 0;
+
+static uint32_t delivery_pause_start_ms = 0;
+
+// ============================================================
+// Existing reflectance sensor LED display.
+// ============================================================
+
 void Detect_Line_Position(uint8_t data)
 {
     LED1_Output(0x00);
@@ -188,9 +214,6 @@ void Detect_Line_Position(uint8_t data)
     }
 }
 
-/**
- * @brief Counts sensors detecting black.
- */
 static uint8_t Count_Black_Sensors(uint8_t data)
 {
     uint8_t count = 0;
@@ -207,9 +230,6 @@ static uint8_t Count_Black_Sensors(uint8_t data)
     return count;
 }
 
-/**
- * @brief Detects a T-intersection pattern.
- */
 static uint8_t Is_T_Intersection(uint8_t data)
 {
     return (data == T_INTERSECTION) ||
@@ -218,9 +238,6 @@ static uint8_t Is_T_Intersection(uint8_t data)
             (Count_Black_Sensors(data) >= 6));
 }
 
-/**
- * @brief Checks for a left corner.
- */
 static uint8_t Is_Left_Corner(uint8_t data)
 {
     return ((data & 0xE0u) == 0xE0u) &&
@@ -228,9 +245,6 @@ static uint8_t Is_Left_Corner(uint8_t data)
            ((data & 0x03u) == 0);
 }
 
-/**
- * @brief Checks for a right corner.
- */
 static uint8_t Is_Right_Corner(uint8_t data)
 {
     return ((data & 0x07u) == 0x07u) &&
@@ -238,9 +252,6 @@ static uint8_t Is_Right_Corner(uint8_t data)
            ((data & 0xC0u) == 0);
 }
 
-/**
- * @brief Follows the black line using proportional correction.
- */
 void Line_Follower_Controller(uint8_t data)
 {
     int32_t position;
@@ -283,11 +294,10 @@ void Line_Follower_Controller(uint8_t data)
     }
 }
 
-/**
- * @brief Starts the original Lab 3 sensor-based turn.
- *
- * This routine is used by Station C.
- */
+// ============================================================
+// Existing original Lab 3 turn logic for Station C.
+// ============================================================
+
 static void Start_Turn(Turn_State requested_turn)
 {
     turn_state = requested_turn;
@@ -305,12 +315,10 @@ static void Start_Turn(Turn_State requested_turn)
     }
 }
 
-/**
- * @brief Starts the dedicated A/B timed maneuver.
- *
- * First rotate left, then move straight forward.
- * Sensor-based navigation resumes afterward.
- */
+// ============================================================
+// Existing verified Station A/B maneuver.
+// ============================================================
+
 static void Start_AB_Maneuver(void)
 {
     warehouse_ab_state = AB_ROTATING;
@@ -322,9 +330,6 @@ static void Start_AB_Maneuver(void)
     Motor_Left(PWM_NOMINAL, PWM_NOMINAL);
 }
 
-/**
- * @brief Executes the A/B turn-then-forward maneuver.
- */
 static void Execute_AB_Maneuver(uint8_t data)
 {
     uint32_t elapsed =
@@ -338,8 +343,6 @@ static void Execute_AB_Maneuver(uint8_t data)
             return;
         }
 
-        // Finish the rotation.
-        // Begin the straight-forward stage.
         warehouse_ab_state = AB_MOVING_FORWARD;
         warehouse_ab_stage_start_ms = Timer_A1_ms_elapsed;
 
@@ -351,13 +354,10 @@ static void Execute_AB_Maneuver(uint8_t data)
     {
         if (elapsed < AB_FORWARD_MS)
         {
-            // Ignore sensor readings during this movement.
             Motor_Forward(PWM_NOMINAL, PWM_NOMINAL);
             return;
         }
 
-        // Both stages are complete.
-        // Resume normal sensor-based line following.
         warehouse_ab_state = AB_IDLE;
 
         last_turn_finish_ms = Timer_A1_ms_elapsed;
@@ -370,13 +370,10 @@ static void Execute_AB_Maneuver(uint8_t data)
     }
 }
 
-/**
- * @brief Original Lab 3 sensor-based turning routine.
- *
- * Station C uses this function.
- * It requires the minimum turning duration and two
- * consecutive centered readings before finishing.
- */
+// ============================================================
+// Existing sensor-based turn execution for Station C.
+// ============================================================
+
 static void Execute_Turn(uint8_t data)
 {
     uint32_t elapsed =
@@ -436,9 +433,6 @@ static void Execute_Turn(uint8_t data)
     }
 }
 
-/**
- * @brief Confirms a dead end using consecutive white readings.
- */
 static uint8_t Dead_End_Confirmed(uint8_t data)
 {
     if (data == DEAD_END)
@@ -456,9 +450,6 @@ static uint8_t Dead_End_Confirmed(uint8_t data)
     return (dead_end_count >= DEAD_END_SAMPLES);
 }
 
-/**
- * @brief Follows the track and handles corner patterns.
- */
 static void Follow_Track(uint8_t data)
 {
     if ((Timer_A1_ms_elapsed - last_turn_finish_ms)
@@ -487,9 +478,10 @@ static void Follow_Track(uint8_t data)
     }
 }
 
-/**
- * @brief Counts warehouse junctions using confirmation and latching.
- */
+// ============================================================
+// Existing warehouse junction counting - unchanged.
+// ============================================================
+
 static void Count_Warehouse_Junctions(uint8_t data)
 {
     uint8_t junction_detected;
@@ -543,12 +535,13 @@ static void Count_Warehouse_Junctions(uint8_t data)
     }
 }
 
-/**
- * @brief Controls navigation toward the selected warehouse station.
- *
- * A/B use the timed maneuver.
- * C uses the original Lab 3 turning routine.
- */
+// ============================================================
+// Navigation controller.
+//
+// NEW: Delivery-marker detection and 3-second pause.
+// The existing turn-selection logic remains unchanged.
+// ============================================================
+
 void Navigation_Controller(uint8_t data)
 {
     if (!warehouse_run_enabled)
@@ -566,21 +559,124 @@ void Navigation_Controller(uint8_t data)
         return;
     }
 
-    // Stations A/B: complete both timed stages
-    // before sensor-based navigation resumes.
+    // --------------------------------------------------------
+    // NEW - Phase 8: Maintain the 3-second delivery pause.
+    // --------------------------------------------------------
+    if (delivery_phase == DELIVERY_PAUSING)
+    {
+        Motor_Stop();
+
+        if ((Timer_A1_ms_elapsed - delivery_pause_start_ms)
+            >= DELIVERY_PAUSE_MS)
+        {
+            delivery_phase = DELIVERY_PAUSE_COMPLETE;
+        }
+
+        return;
+    }
+
+    // NEW - Keep the robot stopped until Phase 9 is added.
+    // Red LED1 indicates the 3-second pause has completed.
+    if (delivery_phase == DELIVERY_PAUSE_COMPLETE)
+    {
+        Motor_Stop();
+        LED1_Output(0x01);
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Existing Station A/B maneuver - unchanged.
+    // --------------------------------------------------------
     if (warehouse_ab_state != AB_IDLE)
     {
         Execute_AB_Maneuver(data);
         return;
     }
 
-    // Station C: original Lab 3 turn handling.
+    // --------------------------------------------------------
+    // Existing Station C sensor-based turn - unchanged.
+    // --------------------------------------------------------
     if (turn_state != NO_TURN)
     {
         Execute_Turn(data);
         return;
     }
 
+    // --------------------------------------------------------
+    // NEW - Phase 7: Delivery T-marker detection.
+    //
+    // Only examine delivery markers after the selected
+    // station turn has completed.
+    //
+    // First confirm a normal centered branch line.
+    // This prevents the original junction's 0xFF
+    // pattern from triggering a premature delivery stop.
+    // --------------------------------------------------------
+    if ((navigation_state == EXPLORE_MAZE) &&
+        (warehouse_turn_requested == 2u))
+    {
+        if (delivery_phase == DELIVERY_WAIT_FOR_BRANCH)
+        {
+            if (((data & 0x18u) != 0u) &&
+                !Is_T_Intersection(data) &&
+                !Is_Left_Corner(data) &&
+                !Is_Right_Corner(data))
+            {
+                if (delivery_branch_count <
+                    DELIVERY_BRANCH_CONFIRM_SAMPLES)
+                {
+                    delivery_branch_count++;
+                }
+
+                if (delivery_branch_count >=
+                    DELIVERY_BRANCH_CONFIRM_SAMPLES)
+                {
+                    delivery_phase = DELIVERY_SEARCH_FOR_MARKER;
+                    delivery_marker_count = 0;
+                }
+            }
+            else
+            {
+                delivery_branch_count = 0;
+            }
+        }
+        else if (delivery_phase == DELIVERY_SEARCH_FOR_MARKER)
+        {
+            // Require exactly 0xFF for three
+            // consecutive reflectance sensor readings.
+            if (data == 0xFFu)
+            {
+                if (delivery_marker_count <
+                    DELIVERY_MARKER_CONFIRM_SAMPLES)
+                {
+                    delivery_marker_count++;
+                }
+
+                if (delivery_marker_count >=
+                    DELIVERY_MARKER_CONFIRM_SAMPLES)
+                {
+                    // Delivery marker confirmed.
+                    delivery_phase = DELIVERY_PAUSING;
+
+                    // Start the 3-second pause.
+                    delivery_pause_start_ms =
+                        Timer_A1_ms_elapsed;
+
+                    Motor_Stop();
+                    return;
+                }
+            }
+            else
+            {
+                // A non-0xFF reading breaks the sequence.
+                delivery_marker_count = 0;
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    // Existing warehouse navigation - unchanged.
+    // --------------------------------------------------------
     switch (navigation_state)
     {
         case EXPLORE_MAZE:
@@ -588,7 +684,6 @@ void Navigation_Controller(uint8_t data)
             uint8_t previous_junction_count =
                 warehouse_junction_count;
 
-            // Arm navigation after seeing a centered line.
             if (!warehouse_route_armed)
             {
                 if (((data & 0x18u) == 0x18u) &&
@@ -615,7 +710,6 @@ void Navigation_Controller(uint8_t data)
                 break;
             }
 
-            // Count junctions until the selected one is reached.
             if (warehouse_turn_requested == 0u)
             {
                 Count_Warehouse_Junctions(data);
@@ -631,14 +725,12 @@ void Navigation_Controller(uint8_t data)
 
                 if (warehouse_active_destination <= 2u)
                 {
-                    // Station A or B:
-                    // 1200 ms left, then 200 ms forward.
+                    // A/B: Verified timed maneuver.
                     Start_AB_Maneuver();
                 }
                 else
                 {
-                    // Station C:
-                    // Original Lab 3 sensor-based left turn.
+                    // C: Original Lab 3 sensor-based turn.
                     Start_Turn(TURN_LEFT_90);
                 }
             }
@@ -650,6 +742,7 @@ void Navigation_Controller(uint8_t data)
             break;
         }
 
+        // Legacy Lab 3 maze states remain unchanged.
         case EXPLORE_INTERSECTION:
         {
             switch (intersection_phase)
@@ -775,7 +868,8 @@ void Navigation_Controller(uint8_t data)
 /**
  * @brief Timer_A1 periodic task.
  *
- * Updates the sensor readings every 10 ms.
+ * The reflectance sensors are sampled every 10 ms.
+ * This timing remains unchanged.
  */
 void Timer_A1_Periodic_Task(void)
 {
@@ -798,9 +892,7 @@ void Timer_A1_Periodic_Task(void)
 }
 
 /**
- * @brief Immediately stops the robot after a bumper collision.
- *
- * Prevents restarting until reset.
+ * @brief Permanent bumper-triggered emergency stop.
  */
 static void Bumper_Collision_Handler(uint8_t bumper_state)
 {
@@ -814,7 +906,7 @@ static void Bumper_Collision_Handler(uint8_t bumper_state)
 }
 
 /**
- * @brief Main program initialization and Bluetooth command handling.
+ * @brief Hardware initialization and Bluetooth commands.
  */
 int main(void)
 {
@@ -850,10 +942,6 @@ int main(void)
     }
 
     // SysTick remains disabled.
-    // SysTick_Interrupt_Init(
-    //     SYSTICK_INT_NUM_CLK_CYCLES,
-    //     SYSTICK_INT_PRIORITY
-    // );
 
     Timer_A1_Interrupt_Init(
         &Timer_A1_Periodic_Task,
